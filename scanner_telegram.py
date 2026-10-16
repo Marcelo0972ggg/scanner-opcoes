@@ -1,93 +1,76 @@
 # ==============================================================================
-# SCANNER DE OPÇÕES COM ALERTA AUTOMÁTICO NO TELEGRAM
+# MÓDULO DE MONITORAMENTO DE POSIÇÕES ATIVAS (TRACKER DIÁRIO)
 # ==============================================================================
 
-import os
-import requests
-import yfinance as yf
-import pandas as pd
-import numpy as np
+import json
+from datetime import datetime
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-TICKERS = [
-    "BOVA11.SA", "PETR4.SA", "VALE3.SA", "BBAS3.SA", "ITUB4.SA", 
-    "BBDC4.SA", "ITSA4.SA", "ABEV3.SA", "WEGE3.SA", "PRIO3.SA"
-]
-
-def enviar_telegram(mensagem):
-    if not TOKEN or not CHAT_ID:
-        print("⚠️ Credenciais do Telegram não configuradas.")
+# Exemplo de função para carregar e checar suas operações abertas
+def checar_posicoes_ativas():
+    print("🔄 Verificando posições abertas na carteira...")
+    
+    # Se o arquivo posicoes.json existir no repositório, ele faz a leitura
+    if not os.path.exists("posicoes.json"):
+        print("ℹ️ Nenhum arquivo 'posicoes.json' encontrado para monitorar.")
         return
-    
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID, 
-        "text": mensagem, 
-        "parse_mode": "Markdown"
-    }
-    
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            print("✅ Alerta enviado com sucesso para o Telegram!")
-        else:
-            print(f"⚠️ Erro ao enviar para o Telegram: {response.text}")
-    except Exception as e:
-        print(f"❌ Erro de conexão ao enviar mensagem: {e}")
 
-def calcular_rsi(df, period=14):
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    with open("posicoes.json", "r") as f:
+        posicoes = json.load(f)
 
-def rodar_scanner():
-    print("🔎 Executando scanner diário de ativos...")
-    oportunidades = []
-    
-    for ticker in TICKERS:
+    alertas_manejo = []
+    hoje = datetime.now()
+
+    for pos in posicoes:
         try:
-            dados = yf.download(ticker, period="1y", interval="1d", progress=False)
-            if dados.empty or len(dados) < 60:
+            ticker = pos["ativo"] + ".SA"
+            data_venc = datetime.strptime(pos["data_vencimento"], "%Y-%m-%d")
+            data_mora = data_venc - timedelta(days=25) # Janela ideal de 25 dias
+            
+            # Contagem regressiva de dias
+            dias_para_vencimento = (data_venc - hoje).days
+            dias_para_manejo = (data_mora - hoje).days
+
+            # Puxa preço atual do ativo na B3
+            dados = yf.download(ticker, period="5d", interval="1d", progress=False)
+            if dados.empty:
                 continue
             
             if isinstance(dados.columns, pd.MultiIndex):
                 dados.columns = dados.columns.get_level_values(0)
-            
-            df = dados.copy()
-            df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
-            df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
-            df['SMA50'] = df['Close'].rolling(window=50).mean()
-            df['RSI14'] = calcular_rsi(df, 14)
-            
-            ultimo = df.iloc[-1]
-            preco_atual = float(ultimo['Close'])
-            ema9 = float(ultimo['EMA9'])
-            ema21 = float(ultimo['EMA21'])
-            sma50 = float(ultimo['SMA50'])
-            rsi = float(ultimo['RSI14'])
-            
-            tendencia_alta = (ema9 >= ema21) and (ema21 >= sma50)
-            perto_m9 = (((preco_atual - ema9) / ema9) * 100) <= 2.5
-            rsi_comportado = rsi <= 65
-            
-            if tendencia_alta and perto_m9 and rsi_comportado:
-                nome_limpo = ticker.replace(".SA", "")
-                strike_ref = round(preco_atual * 0.90, 2)
-                oportunidades.append(f"🟢 *{nome_limpo}* | Preço: R$ {preco_atual:.2f} | Strike Ref: R$ {strike_ref}")
-        except Exception as e:
-            print(f"Erro ao processar {ticker}: {e}")
-            continue
-            
-    if oportunidades:
-        texto = "🚨 *Oportunidades Encontradas (Trava de Alta com Put):*\n\n" + "\n".join(oportunidades)
-        enviar_telegram(texto)
-    else:
-        print("🔍 Nenhuma oportunidade encontrada hoje.")
 
-if __name__ == "__main__":
-    rodar_scanner()
-  
+            preco_atual = float(dados['Close'].iloc[-1])
+            strike_v = pos.get("strike_vendida", 0)
+            premio_inicial = pos.get("premio_recebido", 1.0)
+            alvo_pct = pos.get("alvo_lucro_pct", 70.0) # Padrão de 70% de lucro
+
+            # Estimativa de proteção/distância do strike vendida em Travas de Put
+            distancia_strike_pct = ((preco_atual - strike_v) / preco_atual) * 100 if strike_v > 0 else 0
+
+            # CONDIÇÃO 1: Faltam 25 a 21 dias ou menos para o vencimento (Alerta de Tempo)
+            alerta_tempo = False
+            if dias_para_vencimento <= 25:
+                alerta_tempo = True
+
+            # CONDIÇÃO 2: Distância do strike muito favorável (Preço subiu bem e o prêmio derreteu > 70%)
+            alerta_lucro = False
+            if distancia_strike_pct > 6.0 and dias_para_vencimento <= 30:
+                alerta_lucro = True
+
+            # Monta a mensagem se atingir a janela de tempo OU a meta de lucro
+            if alerta_tempo or alerta_lucro:
+                motivo = "⏳ *JANELA DE 25 DIAS ATINGIDA!*" if alerta_tempo else "💰 *META DE LUCRO ESTIMADA (60%-75%)!*"
+                
+                alertas_manejo.append(
+                    f"🔔 *ALERTA DE MANEJO / ENCERRAMENTO - [{pos['ativo']}]*\n"
+                    f"• {motivo}\n"
+                    f"• Preço Atual: R$ {preco_atual:.2f} (Distância do Strike: +{distancia_strike_pct:.1f}%)\n"
+                    f"📅 *Dias Restantes para Vencimento:* `{dias_para_vencimento} dias`\n"
+                    f"🎯 *Recomendação:* Verificar no Home Broker para encerrar/zerar a trava e colocar a gordura no bolso!\n"
+                )
+
+        except Exception as e:
+            print(f"Erro ao processar posição de {pos.get('ativo')}: {e}")
+
+    if alertas_manejo:
+        msg_carteira = "📢 *ACOMPANHAMENTO DIÁRIO DE POSIÇÕES ATIVAS* 📢\n\n" + "\n".join(alertas_manejo)
+        enviar_telegram(msg_carteira)
